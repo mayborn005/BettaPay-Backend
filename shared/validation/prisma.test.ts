@@ -146,3 +146,89 @@ test('buildPrismaConnectionUrl uses defaults when no poolSize or timeout given',
   const result = buildPrismaConnectionUrl(url);
   assert.strictEqual(result, 'postgresql://user:pass@localhost:5432/bettapay?connection_limit=10&pool_timeout=10');
 });
+
+test('buildPrismaConnectionUrl rejects invalid pool ranges early', () => {
+  const url = 'postgresql://user:pass@localhost:5432/bettapay';
+  assert.throws(() => buildPrismaConnectionUrl(url, 0, 10), /DATABASE_POOL_SIZE.*1/);
+  assert.throws(() => buildPrismaConnectionUrl(url, 10, 0), /DATABASE_POOL_TIMEOUT.*1/);
+});
+
+import {
+  resetRotation,
+  hasRotated,
+  getActiveConnectionUrl,
+  connectWithRetryWithRotation,
+} from './prisma.js';
+
+test('connectWithRetryWithRotation switches to rotate URL on 28P01', async () => {
+  resetRotation();
+  let attempts = 0;
+  const prisma = {
+    async $connect() {
+      attempts += 1;
+      if (attempts === 1) {
+        const err = new Error('authentication failed');
+        (err as any).code = '28P01';
+        throw err;
+      }
+    },
+  };
+
+  await connectWithRetryWithRotation(prisma, {
+    debug: () => undefined,
+    warn: () => undefined,
+  }, { rotationUrl: 'postgres://rotated/db', baseDelayMs: 1, maxRetries: 5 });
+
+  assert.strictEqual(hasRotated(), true);
+  assert.strictEqual(getActiveConnectionUrl('postgres://primary/db'), 'postgres://rotated/db');
+  resetRotation();
+});
+
+test('connectWithRetryWithRotation does not switch on primary URL success', async () => {
+  resetRotation();
+  const prisma = {
+    async $connect() {},
+  };
+
+  await connectWithRetryWithRotation(prisma, {
+    debug: () => undefined,
+    warn: () => undefined,
+  }, { rotationUrl: 'postgres://rotated/db', baseDelayMs: 1, maxRetries: 3 });
+
+  assert.strictEqual(hasRotated(), false);
+  assert.strictEqual(getActiveConnectionUrl('postgres://primary/db'), 'postgres://primary/db');
+  resetRotation();
+});
+
+test('rotation logged at warn level', async () => {
+  resetRotation();
+  let attempts = 0;
+  const prisma = {
+    async $connect() {
+      attempts += 1;
+      if (attempts === 1) {
+        const err = new Error('authentication failed');
+        (err as any).code = '28P01';
+        throw err;
+      }
+    },
+  };
+
+  const warnMessages: string[] = [];
+  const logger = {
+    debug: () => undefined,
+    warn: (_obj: object, msg?: string) => {
+      if (msg) warnMessages.push(msg);
+    },
+  };
+
+  await connectWithRetryWithRotation(prisma, logger, { rotationUrl: 'postgres://rotated/db', baseDelayMs: 1, maxRetries: 5 });
+
+  assert.ok(warnMessages.some(m => m.includes('credential rotation') || m.includes('authentication error')));
+  resetRotation();
+});
+
+test('getActiveConnectionUrl returns primary URL when no rotation', () => {
+  resetRotation();
+  assert.strictEqual(getActiveConnectionUrl('postgres://primary/db'), 'postgres://primary/db');
+});

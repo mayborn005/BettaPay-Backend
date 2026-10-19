@@ -3,10 +3,14 @@ import assert from 'node:assert/strict';
 import {
   aggregateAllHealth,
   buildHealthResponse,
+  buildIndexerHealthResponse,
   buildSettlementEngineHealthResponse,
   checkBullMQ,
+  checkPostgresql,
+  checkRedisPing,
   computeOverallStatus,
 } from './health.js';
+
 import type { DependencyHealth, HealthResponse } from './schemas.js';
 
 function dep(name: string, status: 'connected' | 'disconnected'): DependencyHealth {
@@ -166,6 +170,46 @@ test('buildSettlementEngineHealthResponse marks unhealthy when the queue is paus
   assert.equal(health.status, 'unhealthy');
 });
 
+test('buildSettlementEngineHealthResponse forwards redisHealthState into the redis dependency details', async () => {
+  const health = await buildSettlementEngineHealthResponse({
+    queryDatabase: async () => [{ '?column?': 1 }],
+    pingRedis: async () => 'PONG',
+    getQueueJobCounts: async () => ({ waiting: 0, active: 0, failed: 0, delayed: 0 }),
+    getQueueIsPaused: async () => false,
+    redisHealthState: { connected: true, errors: 3, lastError: 'ECONNRESET', reconnects: 1 },
+    startTime: Date.now(),
+    service: 'settlement-engine',
+    version: '0.1.0',
+  });
+
+  const redisDep = health.dependencies.find((d) => d.name === 'redis');
+  assert.ok(redisDep?.details);
+  assert.equal(redisDep!.details!.errors, 3);
+  assert.equal(redisDep!.details!.reconnects, 1);
+  assert.equal(redisDep!.details!.lastError, 'ECONNRESET');
+});
+
+test('buildIndexerHealthResponse forwards redisHealthState into the redis dependency details', async () => {
+  const health = await buildIndexerHealthResponse({
+    queryDatabase: async () => [{ '?column?': 1 }],
+    pingRedis: async () => 'PONG',
+    getQueueJobCounts: async () => ({ waiting: 0, active: 0, failed: 0, delayed: 0 }),
+    getQueueIsPaused: async () => false,
+    redisHealthState: { connected: false, errors: 7, lastError: 'ETIMEDOUT', reconnects: 2 },
+    getLatestLedger: async () => ({ sequence: 100 }),
+    lagWarnThreshold: 50,
+    startTime: Date.now(),
+    service: 'indexer',
+    version: '0.1.0',
+  });
+
+  const redisDep = health.dependencies.find((d) => d.name === 'redis');
+  assert.ok(redisDep?.details);
+  assert.equal(redisDep!.details!.errors, 7);
+  assert.equal(redisDep!.details!.reconnects, 2);
+  assert.equal(redisDep!.details!.lastError, 'ETIMEDOUT');
+});
+
 test('aggregateAllHealth returns healthy when gateway and downstream services are healthy', async () => {
   const gatewayHealth = buildHealthResponse({
     service: 'api-gateway',
@@ -188,4 +232,104 @@ test('aggregateAllHealth returns healthy when gateway and downstream services ar
 
   assert.equal(aggregated.status, 'healthy');
   assert.equal(Object.keys(aggregated.services).length, 2);
+});
+
+test('checkPostgresql returns healthy with latency and optional serverVersion', async () => {
+  const dependency = await checkPostgresql(async () => [
+    { '?column?': 1, serverVersion: new Date().toISOString() },
+  ]);
+
+  assert.equal(dependency.status, 'connected');
+  assert.equal(dependency.healthy, true);
+  assert.equal(typeof dependency.latencyMs, 'number');
+  assert.ok(dependency.latencyMs! < 1000);
+  assert.equal(typeof dependency.serverVersion, 'string');
+});
+
+test('buildHealthResponse marks degraded when database latency exceeds threshold', () => {
+  const response = buildHealthResponse({
+    service: 'db-service',
+    version: '0.1.0',
+    startTime: Date.now() - 5000,
+    dependencies: [
+      {
+        name: 'postgresql',
+        status: 'connected',
+        latencyMs: 1500,
+        healthy: true,
+        serverVersion: null,
+      } as any,
+    ],
+  });
+
+  assert.equal(response.status, 'degraded');
+});
+
+test('checkPostgresql measures slow latency as degraded in buildHealthResponse', async () => {
+  const dependency = await checkPostgresql(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 1105));
+    return [{ '?column?': 1, serverVersion: new Date().toISOString() }];
+  });
+
+  assert.equal(dependency.status, 'connected');
+  assert.equal(dependency.healthy, true);
+  assert.ok(dependency.latencyMs! > 1000);
+
+  const response = buildHealthResponse({
+    service: 'db-service',
+    version: '0.1.0',
+    startTime: Date.now() - 5000,
+    dependencies: [dependency as any],
+  });
+
+  assert.equal(response.status, 'degraded');
+});
+
+test('checkRedisPing includes health state details when provided', async () => {
+  const healthState = {
+    connected: true,
+    errors: 2,
+    lastError: 'Connection timeout',
+    reconnects: 1,
+  };
+
+  const dep = await checkRedisPing(async () => 'PONG', undefined, healthState);
+
+  assert.equal(dep.status, 'connected');
+  assert.ok(dep.details);
+  assert.equal(dep.details.connected, true);
+  assert.equal(dep.details.errors, 2);
+  assert.equal(dep.details.reconnects, 1);
+  assert.equal(dep.details.lastError, 'Connection timeout');
+});
+
+test('checkRedisPing reports disconnected with health state when ping fails', async () => {
+  const healthState = {
+    connected: false,
+    errors: 5,
+    lastError: 'ECONNREFUSED',
+    reconnects: 3,
+  };
+
+  const dep = await checkRedisPing(
+    async () => {
+      throw new Error('Connection refused');
+    },
+    undefined,
+    healthState,
+  );
+
+  assert.equal(dep.status, 'disconnected');
+  assert.ok(dep.details);
+  assert.equal(dep.details.connected, false);
+  assert.equal(dep.details.errors, 5);
+  assert.equal(dep.details.reconnects, 3);
+  assert.equal(dep.details.lastError, 'ECONNREFUSED');
+});
+
+test('checkRedisPing omits details when healthState is not provided (backward compatible)', async () => {
+  const dep = await checkRedisPing(async () => 'PONG');
+
+  assert.equal(dep.status, 'connected');
+  assert.equal(dep.details, undefined);
 });

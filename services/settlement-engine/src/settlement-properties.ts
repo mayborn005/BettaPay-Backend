@@ -5,6 +5,8 @@
  * and mapping functions used across bulk and single settlement tasks.
  */
 
+import BigNumber from 'bignumber.js';
+
 export interface SystemThresholds {
   minLimitDefault: string;
   maxLimitDefault: string;
@@ -28,7 +30,7 @@ export interface AssetPrecisionConfig {
 export const ASSET_PRECISION_MAPPINGS: Record<string, AssetPrecisionConfig> = {
   USDC: {
     assetCode: 'USDC',
-    decimals: 6,
+    decimals: 7,
     roundingMode: 'down',
   },
   EURT: {
@@ -66,4 +68,73 @@ export function getAssetPrecision(asset: string): AssetPrecisionConfig {
  */
 export function isSupportedAsset(asset: string): boolean {
   return asset.toUpperCase() in ASSET_PRECISION_MAPPINGS;
+}
+
+export interface SettlementInvariantInput {
+  grossAmount: string;
+  feeAmount: string;
+  netAmount: string;
+  feeBps?: number;
+}
+
+export function assertSettlementInvariants({
+  grossAmount,
+  feeAmount,
+  netAmount,
+  feeBps,
+}: SettlementInvariantInput): void {
+  const gross = new BigNumber(grossAmount);
+  const fee = new BigNumber(feeAmount);
+  const net = new BigNumber(netAmount);
+
+  if (!gross.isFinite() || !fee.isFinite() || !net.isFinite()) {
+    throw new Error('Settlement invariant violated: amounts must be finite decimal values');
+  }
+
+  if (!fee.plus(net).isEqualTo(gross)) {
+    throw new Error('Settlement invariant violated: feeAmount + netAmount === grossAmount');
+  }
+
+  if (fee.isLessThan(0)) {
+    throw new Error('Settlement invariant violated: feeAmount must be >= 0');
+  }
+
+  if (net.isGreaterThan(gross)) {
+    throw new Error('Settlement invariant violated: netAmount must be <= grossAmount');
+  }
+
+  if (feeBps !== undefined && (feeBps < 0 || feeBps > 10_000)) {
+    throw new Error('Settlement invariant violated: feeBps must be within [0, 10000]');
+  }
+}
+
+/**
+ * Prisma Query Timeout Configuration (#923)
+ *
+ * Configurable statement timeout for settlement Prisma queries to prevent
+ * slow database calls from holding connection-pool slots indefinitely.
+ *
+ * Timeout is applied via SET LOCAL statement_timeout in PostgreSQL.
+ * Queries exceeding this timeout will be aborted and surface as QueryTimeoutError.
+ *
+ * Default: 5000ms (5 seconds)
+ * Min: 1000ms (1 second)
+ * Max: 60000ms (60 seconds)
+ */
+export const SETTLEMENT_QUERY_TIMEOUT_MS = Number(
+  process.env.SETTLEMENT_QUERY_TIMEOUT_MS ?? 5000
+);
+
+export function validateQueryTimeout(): void {
+  const MIN_TIMEOUT = 1000;
+  const MAX_TIMEOUT = 60000;
+
+  if (
+    SETTLEMENT_QUERY_TIMEOUT_MS < MIN_TIMEOUT ||
+    SETTLEMENT_QUERY_TIMEOUT_MS > MAX_TIMEOUT
+  ) {
+    throw new Error(
+      `SETTLEMENT_QUERY_TIMEOUT_MS (${SETTLEMENT_QUERY_TIMEOUT_MS}ms) must be within [${MIN_TIMEOUT}, ${MAX_TIMEOUT}]`
+    );
+  }
 }
